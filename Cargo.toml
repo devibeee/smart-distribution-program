@@ -1,0 +1,11 @@
+[workspace]
+members = ["programs/pump-vault-settlement"]
+resolver = "2"
+
+[workspace.metadata.cli]
+solana = "4.0.0"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"

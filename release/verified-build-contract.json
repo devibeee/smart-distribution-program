@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "sourceRepository": "https://github.com/devibeee/smart-distribution-program",
+  "programId": "45TYikBDuxngJzkxqiMpuzudnA5VaW47renkjE5XFCge",
+  "programDataAddress": "AXoGYCoQBjuDFoQGdyTxtS8mdpfSrPfkntm8jWNUeZkX",
+  "upgradeableLoaderProgramId": "BPFLoaderUpgradeab1e11111111111111111111111",
+  "libraryName": "pump_vault_settlement",
+  "toolchain": {
+    "solanaVerifyCli": "0.5.1",
+    "agaveCli": "4.0.0",
+    "dockerImage": "solanafoundation/solana-verifiable-build@sha256:0b4e3716fad9ca4b4aac3e3f977f43aad93a18c22296c0c0f44fc22e644bdd68",
+    "dockerImageArchitecture": "linux/amd64",
+    "rustc": "1.93.1",
+    "agaveInstallerSha256": "4a0c065a31828e6343e43acc71a17d4083faf03549cb66755d62f88d23dd309a"
+  },
+  "artifactIdentity": {
+    "schema": "raw-file-and-solana-executable-v1",
+    "fileSha256Algorithm": "sha256-all-bytes",
+    "executableHashAlgorithm": "solana-verify-0.5.1-trim-trailing-zeroes-then-sha256",
+    "hashEncoding": "sha256:<lowercase-hex>",
+    "sizeBytesMeaning": "raw-file-length"
+  },
+  "genesisHashes": {
+    "devnet": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+    "mainnet": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+  },
+  "securityMetadata": {
+    "name": "Smart Distribution",
+    "projectUrl": "https://github.com/devibeee/smart-distribution-program",
+    "contacts": "link:https://github.com/devibeee/smart-distribution-program/security/advisories/new",
+    "policy": "https://github.com/devibeee/smart-distribution-program/security/policy",
+    "sourceCode": "https://github.com/devibeee/smart-distribution-program",
+    "auditors": "",
+    "sourceReleaseSignature": "",
+    "expiry": "2027-12-31"
+  },
+  "mainnetCaps": {
+    "netCostLamports": "100000000",
+    "deployFloatLamports": "1500000000"
+  }
+}
