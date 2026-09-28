@@ -35,7 +35,7 @@
     "expiry": "2027-12-31"
   },
   "mainnetCaps": {
-    "netCostLamports": "100000000",
-    "deployFloatLamports": "1500000000"
+    "netCostLamports": "900000000",
+    "deployFloatLamports": "2750000000"
   }
 }

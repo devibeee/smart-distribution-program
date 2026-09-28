@@ -1,0 +1,5 @@
+# Local compilation output and signing material must never enter the public source release.
+/target/
+**/target/
+.env*
+*-keypair.json

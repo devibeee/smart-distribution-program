@@ -46,14 +46,16 @@ use solana_program::{
 };
 use solana_system_interface::instruction as system_instruction;
 
+mod two_vault;
+mod two_vault_v2;
 mod v2;
 
 declare_id!("45TYikBDuxngJzkxqiMpuzudnA5VaW47renkjE5XFCge");
 
-/// Embedded security.txt (Neodyme standard).
-///
-/// Security researchers inspecting this program on-chain can read the
-/// `security.txt` payload from the program binary to find responsible-disclosure
+// Embedded security.txt (Neodyme standard).
+//
+// Security researchers inspecting this program on-chain can read the
+// `security.txt` payload from the program binary to find responsible-disclosure
 #[cfg(not(feature = "no-entrypoint"))]
 solana_security_txt::security_txt! {
     name: "Smart Distribution",
@@ -89,7 +91,7 @@ const PUMP_SELL_V2_DISCRIMINATOR: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178
 const BASIS_POINTS_DENOMINATOR: u128 = 10_000;
 
 #[cfg(test)]
-const MOCK_SELL_OUTPUT_LAMPORTS: u64 = 777_000;
+const MOCK_SELL_OUTPUT_LAMPORTS: u64 = 7_770_000;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,6 +119,8 @@ pub enum SettlementError {
     BaselineMismatch = 17,
     CleanupMismatch = 18,
     ZeroMinimumRequired = 19,
+    PositiveSellMinimumRequired = 20,
+    PositiveBuyMinimumRequired = 21,
 }
 
 impl From<SettlementError> for ProgramError {
@@ -435,8 +439,15 @@ pub fn process_instruction(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
+    if instruction_data.first() == Some(&two_vault::TAG) {
+        return two_vault::process(program_id, accounts, instruction_data);
+    }
+    if instruction_data.first() == Some(&24) {
+        return two_vault_v2::process(program_id, accounts, instruction_data);
+    }
     if instruction_data.first().is_some_and(|tag| {
         (v2::INIT_DISTRIBUTION_V2_TAG..=v2::REFUND_DISTRIBUTION_V2_TAG).contains(tag)
+            || [v2::BUYBACK_V3_TAG, v2::SELL_AMM_V3_TAG, v2::BUY_AMM_V3_TAG].contains(tag)
     }) {
         return v2::process_v2_instruction(program_id, accounts, instruction_data);
     }
@@ -1428,6 +1439,7 @@ fn pump_sell_v2_instruction(
         AccountMeta::new(*accounts[16].key, false),
         AccountMeta::new(*accounts[17].key, false),
         AccountMeta::new_readonly(*accounts[18].key, false),
+        // Pump sellV2 đã bỏ globalVolumeAccumulator (pump-public-docs main): 26 account.
         AccountMeta::new(*accounts[19].key, false),
         AccountMeta::new(*accounts[20].key, false),
         AccountMeta::new_readonly(*accounts[21].key, false),
@@ -1515,9 +1527,14 @@ fn invoke_pump(ix: &Instruction, accounts: &[AccountInfo]) -> ProgramResult {
     }
     if discriminator == PUMP_BUY_V2_DISCRIMINATOR {
         let max_sol_cost = read_u64_at(&ix.data, 16)?;
+        // Pump treats max_sol_cost as an upper bound. The production quote is
+        // deliberately computed from a smaller, rent-aware budget so a fresh
+        // buyer can fund Pump's lazily-created user-volume accumulator. Model
+        // that actual spend here instead of consuming the full upper bound.
+        let actual_sol_cost = conservative_buy_quote_budget(max_sol_cost)?;
         let bonding_curve = accounts.get(10).ok_or(ProgramError::NotEnoughAccountKeys)?;
         let user = accounts.get(13).ok_or(ProgramError::NotEnoughAccountKeys)?;
-        transfer_from_program_owned(user, bonding_curve, max_sol_cost)?;
+        transfer_from_program_owned(user, bonding_curve, actual_sol_cost)?;
         return Ok(());
     }
     Err(SettlementError::InvalidInstruction.into())
@@ -1589,6 +1606,7 @@ fn system_assign<'a>(
 /// succeed without actually touching the runtime — the security assertions
 /// (PDA derivation, recipient/owner binding) are checked before this point.
 #[cfg(test)]
+#[allow(dead_code)]
 fn invoke(_ix: &Instruction, _accounts: &[AccountInfo]) -> ProgramResult {
     Ok(())
 }
@@ -1609,6 +1627,36 @@ pub struct BuyQuote {
     pub total_fee_bps: u64,
 }
 
+// Pump BuyV2 lazily creates a 137-byte user-volume accumulator for a fresh
+// buyer, funded by that buyer, before moving quote SOL. Reserve its exact rent
+// plus deterministic quote headroom; otherwise a mathematically valid buy can
+// fail after sell/settle because the buyer cannot fund the Pump account create.
+// The transaction remains atomic, but a public fresh-wallet route must not
+// depend on rollback as its normal control flow.
+pub const BUYBACK_QUOTE_RESERVE_BPS: u128 = 50;
+pub const BUYBACK_USER_VOLUME_ACCUMULATOR_BYTES: usize = 137;
+pub const BUYBACK_QUOTE_RESERVE_HEADROOM_LAMPORTS: u128 = 100_000;
+
+fn conservative_buy_quote_budget(funded_lamports: u64) -> Result<u64, ProgramError> {
+    let funded = funded_lamports as u128;
+    let proportional = ceil_div(
+        checked_mul(funded, BUYBACK_QUOTE_RESERVE_BPS)?,
+        BASIS_POINTS_DENOMINATOR,
+    )?;
+    let floor = checked_add(
+        current_rent()?.minimum_balance(BUYBACK_USER_VOLUME_ACCUMULATOR_BYTES) as u128,
+        BUYBACK_QUOTE_RESERVE_HEADROOM_LAMPORTS,
+    )?;
+    let reserve = proportional.max(floor);
+    let budget = funded
+        .checked_sub(reserve)
+        .ok_or(SettlementError::VaultEmpty)?;
+    if budget == 0 || budget > u64::MAX as u128 {
+        return Err(SettlementError::VaultEmpty.into());
+    }
+    Ok(budget as u64)
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Section 7 — Bonding-curve math: dynamic buy quote + fee computation
 // ──────────────────────────────────────────────────────────────────────────
@@ -1622,8 +1670,9 @@ fn dynamic_buy_quote(
     let bonding_curve = decode_bonding_curve(bonding_curve_data)?;
     let global = decode_global(global_data)?;
     let fees = compute_fees(&bonding_curve, &global, fee_config_data)?;
+    let quote_budget = conservative_buy_quote_budget(spendable_quote)?;
     let amount = tokens_out_for_spendable_quote(
-        spendable_quote as u128,
+        quote_budget as u128,
         bonding_curve.virtual_token_reserves,
         bonding_curve.virtual_quote_reserves,
         fees.protocol_fee_bps as u128,
@@ -1959,6 +2008,7 @@ fn read_u64(data: &[u8], offset: &mut usize) -> Result<u64, ProgramError> {
     Ok(value)
 }
 
+#[allow(dead_code)]
 fn settlement_id_hex(value: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(64);
@@ -1977,6 +2027,7 @@ fn settlement_id_hex(value: &[u8; 32]) -> String {
 // without manually dividing by 1e9 or cross-referencing account indices.
 
 /// Format lamports as a SOL string with 6 decimals, e.g. `format_sol(1_500_000_000)` → `"1.500000 SOL"`.
+#[allow(dead_code)]
 fn format_sol(lamports: u64) -> String {
     let whole = lamports / 1_000_000_000;
     let frac = lamports % 1_000_000_000;
@@ -1984,6 +2035,7 @@ fn format_sol(lamports: u64) -> String {
 }
 
 /// Format a raw u64 token amount as a UI string assuming 6 decimals (Pump.fun standard), e.g. `format_token(5_000_000)` → `"5.00 token"`.
+#[allow(dead_code)]
 fn format_token(raw: u64) -> String {
     let whole = raw / 1_000_000;
     let frac = raw % 1_000_000;
@@ -2136,6 +2188,7 @@ mod tests {
             dummy_account(42),
             dummy_account(43),
             dummy_account(44),
+            // Pump sellV2 đã bỏ global_volume_accumulator (26 account).
             dummy_account(45),
             dummy_account(46),
             dummy_account(47),
@@ -2250,6 +2303,21 @@ mod tests {
     fn tokens_out_returns_zero_for_dust_after_fees() {
         let out = tokens_out_for_spendable_quote(1, 100_000, 100_000, 95, 30).unwrap();
         assert_eq!(out, 0);
+    }
+
+    #[test]
+    fn conservative_buy_budget_reserves_rounding_headroom_and_never_exhausts_funding() {
+        let fresh_buyer_floor =
+            Rent::default().minimum_balance(BUYBACK_USER_VOLUME_ACCUMULATOR_BYTES) as u128
+                + BUYBACK_QUOTE_RESERVE_HEADROOM_LAMPORTS;
+        assert_eq!(fresh_buyer_floor, 1_944_400);
+        assert_eq!(
+            conservative_buy_quote_budget(195_061_725).unwrap(),
+            193_117_325
+        );
+        assert!(conservative_buy_quote_budget(1_000_000).is_err());
+        assert!(conservative_buy_quote_budget(10_000).is_err());
+        assert!(conservative_buy_quote_budget(1).is_err());
     }
 
     #[test]
@@ -2495,13 +2563,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(vault_account.lamports(), rent_floor);
-        assert_eq!(buyer_account.lamports(), 10_000_000);
+        let buyback_reserve = MOCK_SELL_OUTPUT_LAMPORTS
+            - conservative_buy_quote_budget(MOCK_SELL_OUTPUT_LAMPORTS).unwrap();
+        assert_eq!(buyer_account.lamports(), 10_000_000 + buyback_reserve);
         let route_after_settle =
             RouteState::unpack(&state_account.try_borrow_data().unwrap()).unwrap();
         assert_eq!(route_after_settle.pending_buy_lamports, 0);
         assert_eq!(
             route_after_settle.total_spent_lamports,
-            MOCK_SELL_OUTPUT_LAMPORTS
+            MOCK_SELL_OUTPUT_LAMPORTS - buyback_reserve
         );
 
         let route = RouteState {
@@ -2559,13 +2629,13 @@ mod tests {
             &buy_with_buyer_balance_data(settlement_id, expires_slot, 10_000_000, 1, 1_000),
         )
         .unwrap();
-        assert_eq!(buyer_account.lamports(), 10_000_000);
+        assert_eq!(buyer_account.lamports(), 10_000_000 + buyback_reserve);
         assert_eq!(tip_account.lamports(), 1_000);
         let route_after_tip =
             RouteState::unpack(&state_account.try_borrow_data().unwrap()).unwrap();
         assert_eq!(
             route_after_tip.total_spent_lamports,
-            MOCK_SELL_OUTPUT_LAMPORTS
+            MOCK_SELL_OUTPUT_LAMPORTS - buyback_reserve
         );
     }
 

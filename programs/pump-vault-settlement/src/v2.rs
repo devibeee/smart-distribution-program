@@ -4,6 +4,8 @@
 //! route mode. Tags 7-11 must appear once, adjacent and in order in the same
 //! transaction. Tag 12 is the seller-bound defensive recovery path.
 
+mod amm;
+
 use super::{
     checked_add_u64, pump_buy_v2_instruction, pump_sell_v2_instruction, require_key,
     require_pump_buy_accounts_v2, require_pump_sell_accounts_v2, require_signer,
@@ -37,6 +39,10 @@ pub const SETTLE_VAULT_TO_BUYER_V2_TAG: u8 = 9;
 pub const BUYBACK_V2_TAG: u8 = 10;
 pub const FINALIZE_DISTRIBUTION_V2_TAG: u8 = 11;
 pub const REFUND_DISTRIBUTION_V2_TAG: u8 = 12;
+/// Additive guarded buyback. Legacy tag 10 retains its zero-minimum contract.
+pub const BUYBACK_V3_TAG: u8 = 20;
+pub const SELL_AMM_V3_TAG: u8 = 21;
+pub const BUY_AMM_V3_TAG: u8 = 22;
 
 const ROUTE_V2_SEED: &[u8] = b"route-v2";
 const VAULT_V2_SEED: &[u8] = b"vault-v2";
@@ -197,6 +203,30 @@ pub fn process_v2_instruction(
             process_settle(program_id, accounts, unpack_route_only(input, tag)?)
         }
         BUYBACK_V2_TAG => process_buyback(program_id, accounts, unpack_buyback(input)?),
+        SELL_AMM_V3_TAG => amm::process_sell(program_id, accounts, unpack_sell(input)?),
+        BUY_AMM_V3_TAG => {
+            require_exact_len(input, 57)?;
+            amm::process_buy(
+                program_id,
+                accounts,
+                read_settlement_id(input, 1)?,
+                read_u64_at(input, 33)?,
+                read_u64_at(input, 41)?,
+                read_u64_at(input, 49)?,
+            )
+        }
+        BUYBACK_V3_TAG => {
+            require_exact_len(input, 49)?;
+            process_buyback_guarded(
+                program_id,
+                accounts,
+                BuybackV2Args {
+                    settlement_id: read_settlement_id(input, 1)?,
+                    min_buy_amount_raw: read_u64_at(input, 33)?,
+                },
+                Some(read_u64_at(input, 41)?),
+            )
+        }
         FINALIZE_DISTRIBUTION_V2_TAG => {
             process_finalize(program_id, accounts, unpack_route_only(input, tag)?)
         }
@@ -314,6 +344,37 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo], args: InitV2Args)
     Ok(())
 }
 
+fn require_sell_limits(expected_sell_amount_raw: u64, args: &SellV2Args) -> ProgramResult {
+    if args.sell_amount_raw != expected_sell_amount_raw {
+        return Err(SettlementError::InvalidRoute.into());
+    }
+    if args.min_sol_output_raw == 0 {
+        return Err(SettlementError::PositiveSellMinimumRequired.into());
+    }
+    if args.min_sol_output_raw > args.max_deposit_lamports {
+        return Err(SettlementError::InvalidRoute.into());
+    }
+    Ok(())
+}
+
+fn validated_sell_proceeds(
+    before: u64,
+    after: u64,
+    min_sol_output_raw: u64,
+    max_deposit_lamports: u64,
+) -> Result<u64, ProgramError> {
+    let proceeds = after
+        .checked_sub(before)
+        .ok_or(SettlementError::SlippageExceeded)?;
+    if proceeds < min_sol_output_raw {
+        return Err(SettlementError::SlippageExceeded.into());
+    }
+    if proceeds > max_deposit_lamports {
+        return Err(SettlementError::DepositCapExceeded.into());
+    }
+    Ok(proceeds)
+}
+
 fn process_sell(program_id: &Pubkey, accounts: &[AccountInfo], args: SellV2Args) -> ProgramResult {
     let iter = &mut accounts.iter();
     let seller = next_account_info(iter)?;
@@ -347,27 +408,25 @@ fn process_sell(program_id: &Pubkey, accounts: &[AccountInfo], args: SellV2Args)
         vault,
         &route,
     )?;
-    if args.sell_amount_raw != route.sell_amount_raw || args.min_sol_output_raw != 0 {
-        return Err(SettlementError::ZeroMinimumRequired.into());
-    }
+    require_sell_limits(route.sell_amount_raw, &args)?;
     if seller.lamports() != route.seller_pre_sell_lamports || args.max_deposit_lamports == 0 {
         return Err(SettlementError::BaselineMismatch.into());
     }
     let pump_accounts: Vec<AccountInfo> = iter.cloned().collect();
     require_pump_sell_accounts_v2(&pump_accounts, seller.key, mint.key)?;
     let before = seller.lamports();
-    let ix = pump_sell_v2_instruction(&pump_accounts, args.sell_amount_raw, 0)?;
+    let ix = pump_sell_v2_instruction(
+        &pump_accounts,
+        args.sell_amount_raw,
+        args.min_sol_output_raw,
+    )?;
     super::invoke_pump(&ix, &pump_accounts)?;
-    let proceeds = seller
-        .lamports()
-        .checked_sub(before)
-        .ok_or(SettlementError::SlippageExceeded)?;
-    if proceeds == 0 {
-        return Err(SettlementError::VaultEmpty.into());
-    }
-    if proceeds > args.max_deposit_lamports {
-        return Err(SettlementError::DepositCapExceeded.into());
-    }
+    let proceeds = validated_sell_proceeds(
+        before,
+        seller.lamports(),
+        args.min_sol_output_raw,
+        args.max_deposit_lamports,
+    )?;
     transfer_from_signer_with_system(seller, vault, &pump_accounts[23], proceeds)?;
     route.status = STATUS_SOLD;
     route.vault_funded_lamports = proceeds;
@@ -434,6 +493,15 @@ fn process_buyback(
     accounts: &[AccountInfo],
     args: BuybackV2Args,
 ) -> ProgramResult {
+    process_buyback_guarded(program_id, accounts, args, None)
+}
+
+fn process_buyback_guarded(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: BuybackV2Args,
+    quote_expires_slot: Option<u64>,
+) -> ProgramResult {
     let iter = &mut accounts.iter();
     let seller = next_account_info(iter)?;
     let buyer = next_account_info(iter)?;
@@ -461,12 +529,23 @@ fn process_buyback(
     require_atomic_sequence_for_state(
         program_id,
         instructions_sysvar,
-        BUYBACK_V2_TAG,
+        if quote_expires_slot.is_some() {
+            BUYBACK_V3_TAG
+        } else {
+            BUYBACK_V2_TAG
+        },
         state,
         vault,
         &route,
     )?;
-    if args.min_buy_amount_raw != 0 {
+    if let Some(expires_slot) = quote_expires_slot {
+        require_buyback_guard(
+            args.min_buy_amount_raw,
+            expires_slot,
+            route.expires_slot,
+            Clock::from_account_info(clock_sysvar)?.slot,
+        )?;
+    } else if args.min_buy_amount_raw != 0 {
         return Err(SettlementError::ZeroMinimumRequired.into());
     }
     let expected_before =
@@ -485,6 +564,11 @@ fn process_buyback(
     if quote.amount_raw == 0 {
         return Err(SettlementError::VaultEmpty.into());
     }
+    if quote.amount_raw < args.min_buy_amount_raw {
+        return Err(SettlementError::SlippageExceeded.into());
+    }
+    // Pump buy_v2 requests this exact token amount, at least the signed floor.
+    // CPI failure rolls back the entire five-instruction route.
     let before = buyer.lamports();
     let ix = pump_buy_v2_instruction(
         &pump_accounts,
@@ -689,16 +773,38 @@ fn require_atomic_sequence(
 ) -> ProgramResult {
     require_key(instructions_sysvar.key, &instructions_sysvar_id())?;
     let current = load_current_index_checked(instructions_sysvar)? as usize;
-    let offset = usize::from(current_tag - INIT_DISTRIBUTION_V2_TAG);
+    let offset = match current_tag {
+        SELL_AMM_V3_TAG => 1,
+        BUYBACK_V3_TAG | BUY_AMM_V3_TAG => 3,
+        INIT_DISTRIBUTION_V2_TAG..=FINALIZE_DISTRIBUTION_V2_TAG => {
+            usize::from(current_tag - INIT_DISTRIBUTION_V2_TAG)
+        }
+        _ => return Err(SettlementError::InvalidSequence.into()),
+    };
     let start = current
         .checked_sub(offset)
         .ok_or(SettlementError::InvalidSequence)?;
+    let sell_tag = load_instruction_at_checked(start + 1, instructions_sysvar)?
+        .data
+        .first()
+        .copied();
+    let buy_tag = load_instruction_at_checked(start + 3, instructions_sysvar)?
+        .data
+        .first()
+        .copied();
+    let sequence = match (sell_tag, buy_tag) {
+        (Some(8), Some(10)) => [7, 8, 9, 10, 11],
+        (Some(8), Some(20)) => [7, 8, 9, 20, 11],
+        (Some(21), Some(22)) if !close_run_created_wsol => [7, 21, 9, 22, 11],
+        _ => return Err(SettlementError::InvalidSequence.into()),
+    };
     let expected_keys = [seller, buyer, mint, state, vault];
     for position in 0..V2_SEQUENCE_LEN {
         let ix = load_instruction_at_checked(start + position, instructions_sysvar)
             .map_err(|_| SettlementError::InvalidSequence)?;
+        let tag_matches = ix.data.first().copied() == Some(sequence[position]);
         if ix.program_id != *program_id
-            || ix.data.first().copied() != Some(INIT_DISTRIBUTION_V2_TAG + position as u8)
+            || !tag_matches
             || ix.data.len() < 33
             || read_settlement_id(&ix.data, 1)? != *settlement_id
             || ix.accounts.len() < expected_keys.len()
@@ -725,7 +831,9 @@ fn require_atomic_sequence(
                 .first()
                 .copied()
                 .ok_or(SettlementError::InvalidSequence)?;
-            if !(INIT_DISTRIBUTION_V2_TAG..=FINALIZE_DISTRIBUTION_V2_TAG).contains(&tag) {
+            if !(INIT_DISTRIBUTION_V2_TAG..=FINALIZE_DISTRIBUTION_V2_TAG).contains(&tag)
+                && ![BUYBACK_V3_TAG, SELL_AMM_V3_TAG, BUY_AMM_V3_TAG].contains(&tag)
+            {
                 return Err(SettlementError::InvalidSequence.into());
             }
             v2_count += 1;
@@ -891,6 +999,21 @@ fn require_status(actual: u8, expected: u8) -> ProgramResult {
         return Err(SettlementError::InvalidStatus.into());
     }
     Ok(())
+}
+
+fn require_buyback_guard(
+    minimum: u64,
+    expires_slot: u64,
+    route_expires_slot: u64,
+    current_slot: u64,
+) -> ProgramResult {
+    if minimum == 0 {
+        return Err(SettlementError::PositiveBuyMinimumRequired.into());
+    }
+    if expires_slot > route_expires_slot {
+        return Err(SettlementError::RouteExpired.into());
+    }
+    require_not_expired(current_slot, expires_slot)
 }
 
 fn require_not_expired(current_slot: u64, expires_slot: u64) -> ProgramResult {
@@ -1149,7 +1272,10 @@ mod tests {
         mint: &AccountInfo<'static>,
         is_buy: bool,
     ) -> Vec<AccountInfo<'static>> {
+        // Pump.fun V2: buy = 27 account (có global_volume_accumulator @19, program @26);
+        // sell = 26 account (Pump đã bỏ global_volume_accumulator, program @25).
         let count = if is_buy { 27 } else { 26 };
+        let system_index = if is_buy { 24 } else { 23 };
         let mut accounts = (0..count)
             .map(|index| {
                 account_info(
@@ -1166,12 +1292,12 @@ mod tests {
         accounts[1] = mint.clone();
         let mut bonding_curve = vec![0; 49];
         bonding_curve[8..16].copy_from_slice(&1_073_000_000_000_000_u64.to_le_bytes());
-        bonding_curve[16..24].copy_from_slice(&30_000_000_000_u64.to_le_bytes());
+        bonding_curve[16..24].copy_from_slice(&30_000_000_000_000_u64.to_le_bytes());
         bonding_curve[24..32].copy_from_slice(&793_100_000_000_000_u64.to_le_bytes());
         bonding_curve[40..48].copy_from_slice(&1_000_000_000_000_000_u64.to_le_bytes());
         accounts[10] = account_info(key(70), crate::id(), 10_000_000, bonding_curve, false, true);
         accounts[13] = user.clone();
-        accounts[23] = account_info(
+        accounts[system_index] = account_info(
             system_program::id(),
             system_program::id(),
             1,
@@ -1188,6 +1314,171 @@ mod tests {
             false,
         );
         accounts
+    }
+
+    #[test]
+    fn guarded_buyback_checks_floor_expiry_and_dispatch_before_spending() {
+        let program_id = crate::id();
+        let seller = account_info(
+            key(1),
+            system_program::id(),
+            100_000_000,
+            vec![],
+            true,
+            true,
+        );
+        let baseline = 1_000_000;
+        let buyer = account_info(
+            key(2),
+            system_program::id(),
+            baseline + MOCK_SELL_OUTPUT_LAMPORTS,
+            vec![],
+            true,
+            true,
+        );
+        let mint = account_info(key(3), TOKEN_PROGRAM_ID, 1, vec![], false, false);
+        let settlement = [4; 32];
+        let (state, vault) = seeded_route(
+            &program_id,
+            &seller,
+            &buyer,
+            &mint,
+            settlement,
+            STATUS_FUNDED,
+            0,
+            baseline,
+            0,
+        );
+        let sysvar = instruction_sysvar(
+            3,
+            program_id,
+            *seller.key,
+            *buyer.key,
+            *mint.key,
+            *state.key,
+            *vault.key,
+            settlement,
+            Some((3, BUYBACK_V3_TAG, None)),
+        );
+        let mut accounts = vec![
+            seller,
+            buyer.clone(),
+            mint.clone(),
+            state.clone(),
+            vault,
+            clock_account(10),
+            sysvar,
+        ];
+        accounts.extend(pump_accounts(&buyer, &mint, true));
+        let data = |minimum: u64, expires: u64| {
+            let mut bytes = vec![BUYBACK_V3_TAG];
+            bytes.extend_from_slice(&settlement);
+            bytes.extend_from_slice(&minimum.to_le_bytes());
+            bytes.extend_from_slice(&expires.to_le_bytes());
+            bytes
+        };
+        let initial = buyer.lamports();
+        for (minimum, expires, expected) in [
+            (0, 100, SettlementError::PositiveBuyMinimumRequired),
+            (1, 9, SettlementError::RouteExpired),
+            (1, 101, SettlementError::RouteExpired),
+            (u64::MAX, 100, SettlementError::SlippageExceeded),
+        ] {
+            assert_eq!(
+                crate::process_instruction(&program_id, &accounts, &data(minimum, expires)),
+                Err(expected.into())
+            );
+            assert_eq!(buyer.lamports(), initial);
+            assert_eq!(
+                DistributionV2State::unpack(&state.try_borrow_data().unwrap())
+                    .unwrap()
+                    .status,
+                STATUS_FUNDED
+            );
+        }
+        for length in [0, 1, 40, 41, 48, 50] {
+            let mut invalid = data(1, 100);
+            invalid.resize(length, 0);
+            assert!(crate::process_instruction(&program_id, &accounts, &invalid).is_err());
+        }
+        crate::process_instruction(&program_id, &accounts, &data(1, 10)).unwrap();
+        assert!(buyer.lamports() < initial);
+        assert!(
+            DistributionV2State::unpack(&state.try_borrow_data().unwrap())
+                .unwrap()
+                .quoted_buy_amount_raw
+                >= 1
+        );
+    }
+
+    #[test]
+    fn guarded_sequence_accepts_only_buyback_position() {
+        let program = crate::id();
+        let identities = [key(1), key(2), key(3), key(4), key(5)];
+        for position in 0..5 {
+            let sysvar = instruction_sysvar(
+                position as u16,
+                program,
+                identities[0],
+                identities[1],
+                identities[2],
+                identities[3],
+                identities[4],
+                [6; 32],
+                Some((3, BUYBACK_V3_TAG, None)),
+            );
+            let current_tag = if position == 3 {
+                BUYBACK_V3_TAG
+            } else {
+                INIT_DISTRIBUTION_V2_TAG + position as u8
+            };
+            assert!(require_atomic_sequence(
+                &program,
+                &sysvar,
+                current_tag,
+                &[6; 32],
+                &identities[0],
+                &identities[1],
+                &identities[2],
+                &identities[3],
+                &identities[4],
+                false
+            )
+            .is_ok());
+        }
+        for (position, tag) in [
+            (0, BUYBACK_V3_TAG),
+            (1, BUYBACK_V3_TAG),
+            (2, BUYBACK_V3_TAG),
+            (4, BUYBACK_V3_TAG),
+            (3, REFUND_DISTRIBUTION_V2_TAG),
+            (3, 19),
+        ] {
+            let sysvar = instruction_sysvar(
+                0,
+                program,
+                identities[0],
+                identities[1],
+                identities[2],
+                identities[3],
+                identities[4],
+                [6; 32],
+                Some((position, tag, None)),
+            );
+            assert!(require_atomic_sequence(
+                &program,
+                &sysvar,
+                INIT_DISTRIBUTION_V2_TAG,
+                &[6; 32],
+                &identities[0],
+                &identities[1],
+                &identities[2],
+                &identities[3],
+                &identities[4],
+                false
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -1232,7 +1523,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_decoder_rejects_trailing_data_and_nonzero_minimums_are_bound() {
+    fn v2_decoder_rejects_trailing_data_and_minimum_contracts_are_bound() {
         let mut init = vec![INIT_DISTRIBUTION_V2_TAG];
         init.extend_from_slice(&[1; 32]);
         init.extend_from_slice(&9_u64.to_le_bytes());
@@ -1249,6 +1540,139 @@ mod tests {
         buy.extend_from_slice(&[2; 32]);
         buy.extend_from_slice(&0_u64.to_le_bytes());
         assert_eq!(unpack_buyback(&buy).unwrap().min_buy_amount_raw, 0);
+
+        let sell = SellV2Args {
+            settlement_id: [3; 32],
+            sell_amount_raw: 10,
+            min_sol_output_raw: 0,
+            max_deposit_lamports: 20,
+        };
+        assert_eq!(
+            require_sell_limits(10, &sell).unwrap_err(),
+            ProgramError::Custom(SettlementError::PositiveSellMinimumRequired as u32)
+        );
+        assert_eq!(
+            require_sell_limits(
+                11,
+                &SellV2Args {
+                    min_sol_output_raw: 1,
+                    ..sell
+                }
+            )
+            .unwrap_err(),
+            ProgramError::Custom(SettlementError::InvalidRoute as u32)
+        );
+        require_sell_limits(
+            10,
+            &SellV2Args {
+                min_sol_output_raw: 1,
+                ..sell
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            require_sell_limits(
+                10,
+                &SellV2Args {
+                    min_sol_output_raw: 21,
+                    ..sell
+                }
+            )
+            .unwrap_err(),
+            ProgramError::Custom(SettlementError::InvalidRoute as u32)
+        );
+    }
+
+    #[test]
+    fn sell_postcondition_enforces_minimum_cap_zero_and_underflow() {
+        let before = 10_000;
+        let minimum = 100;
+        let maximum = 200;
+
+        assert_eq!(
+            validated_sell_proceeds(before, before + minimum, minimum, maximum).unwrap(),
+            minimum
+        );
+        assert_eq!(
+            validated_sell_proceeds(before, before + minimum - 1, minimum, maximum).unwrap_err(),
+            ProgramError::Custom(SettlementError::SlippageExceeded as u32)
+        );
+        assert_eq!(
+            validated_sell_proceeds(before, before + maximum + 1, minimum, maximum).unwrap_err(),
+            ProgramError::Custom(SettlementError::DepositCapExceeded as u32)
+        );
+        assert_eq!(
+            validated_sell_proceeds(before, before, minimum, maximum).unwrap_err(),
+            ProgramError::Custom(SettlementError::SlippageExceeded as u32)
+        );
+        assert_eq!(
+            validated_sell_proceeds(before, before - 1, minimum, maximum).unwrap_err(),
+            ProgramError::Custom(SettlementError::SlippageExceeded as u32)
+        );
+    }
+
+    #[test]
+    fn sell_rejects_mock_cpi_output_one_lamport_below_the_positive_minimum() {
+        let program_id = crate::id();
+        let settlement = [6; 32];
+        let seller = account_info(key(1), system_program::id(), 5_000_000, vec![], true, true);
+        let buyer = account_info(key(2), system_program::id(), 2_000_000, vec![], true, true);
+        let mint = account_info(key(3), system_program::id(), 1, vec![], false, false);
+        let (state, vault) = seeded_route(
+            &program_id,
+            &seller,
+            &buyer,
+            &mint,
+            settlement,
+            STATUS_INITIALIZED,
+            0,
+            buyer.lamports(),
+            0,
+        );
+        let sell_sysvar = instruction_sysvar(
+            1,
+            program_id,
+            *seller.key,
+            *buyer.key,
+            *mint.key,
+            *state.key,
+            *vault.key,
+            settlement,
+            None,
+        );
+        let pump = pump_accounts(&seller, &mint, false);
+        let mut accounts = vec![
+            seller,
+            buyer,
+            mint.clone(),
+            state.clone(),
+            vault.clone(),
+            clock_account(10),
+            sell_sysvar,
+        ];
+        accounts.extend(pump);
+
+        assert_eq!(
+            process_sell(
+                &program_id,
+                &accounts,
+                SellV2Args {
+                    settlement_id: settlement,
+                    sell_amount_raw: 10,
+                    min_sol_output_raw: MOCK_SELL_OUTPUT_LAMPORTS + 1,
+                    max_deposit_lamports: MOCK_SELL_OUTPUT_LAMPORTS + 1,
+                },
+            )
+            .unwrap_err(),
+            ProgramError::Custom(SettlementError::SlippageExceeded as u32)
+        );
+        assert_eq!(vault.lamports(), 0);
+        assert_eq!(
+            DistributionV2State::unpack(&state.try_borrow_data().unwrap())
+                .unwrap()
+                .status,
+            STATUS_INITIALIZED
+        );
     }
 
     #[test]
@@ -1409,7 +1833,7 @@ mod tests {
             SellV2Args {
                 settlement_id: settlement,
                 sell_amount_raw: 10,
-                min_sol_output_raw: 0,
+                min_sol_output_raw: MOCK_SELL_OUTPUT_LAMPORTS,
                 max_deposit_lamports: MOCK_SELL_OUTPUT_LAMPORTS,
             },
         )
@@ -1481,11 +1905,16 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(buyer.lamports(), buyer_baseline);
+        let buyback_reserve = MOCK_SELL_OUTPUT_LAMPORTS
+            - crate::conservative_buy_quote_budget(MOCK_SELL_OUTPUT_LAMPORTS).unwrap();
+        assert_eq!(buyer.lamports(), buyer_baseline + buyback_reserve);
         let bought = DistributionV2State::unpack(&state.try_borrow_data().unwrap()).unwrap();
         assert!(bought.quoted_buy_amount_raw > 0);
-        assert_eq!(bought.actual_spent_lamports, MOCK_SELL_OUTPUT_LAMPORTS);
-        assert_eq!(bought.residual_lamports, 0);
+        assert_eq!(
+            bought.actual_spent_lamports,
+            MOCK_SELL_OUTPUT_LAMPORTS - buyback_reserve
+        );
+        assert_eq!(bought.residual_lamports, buyback_reserve);
 
         let finalize_sysvar = instruction_sysvar(
             4,
